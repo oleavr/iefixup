@@ -25,9 +25,14 @@ inside the last tag of the chunk where they are invisible.
 
     make
 
-Needs `i686-w64-mingw32-gcc` and Python 3. `DEBUG=0` drops logging to QEMU's
-`isa-debugcon` port `0xE9`. `tests/run.sh page.html...` checks on the host that
-the rewriter gives the same result regardless of how the input is chunked.
+Needs rustup and `i686-w64-mingw32-gcc`. The pinned nightly toolchain builds
+`core` and `alloc` for `i586-pc-windows-gnu.json`, an i586 variant of Rust's
+MinGW target, as Windows 95 era CPUs lack SSE2. The result is
+`target/WININET.DLL`, which only imports from `KERNEL32`.
+
+Debug builds log to QEMU's `isa-debugcon` port `0xE9`; build with
+`cargo build --no-default-features` to drop that. `make check` runs the tests
+on the host.
 
 ## Installing
 

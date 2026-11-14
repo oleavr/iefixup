@@ -1,6 +1,0 @@
---target=i686-w64-mingw32
--isystem/usr/i686-w64-mingw32/include
--Isrc
--Ibuild
--D_WIN32_WINNT=0x0400
--DIEFIXUP_DEBUG=1

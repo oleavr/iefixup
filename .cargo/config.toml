@@ -1,0 +1,8 @@
+[build]
+target = "i586-pc-windows-gnu.json"
+
+[unstable]
+json-target-spec = true
+
+[target.i586-pc-windows-gnu]
+linker = "i686-w64-mingw32-gcc"
