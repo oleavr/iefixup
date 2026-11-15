@@ -7,6 +7,8 @@ const HOOKS: &[&str] = &[
     "InternetQueryDataAvailable",
     "InternetReadFile",
     "InternetCloseHandle",
+    "InternetReadFileExA",
+    "HttpSendRequestA",
 ];
 
 const LINK_ARGS: &[&str] = &[
@@ -32,10 +34,9 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let exports = parse_exports(&fs::read_to_string("src/wininet.exports").unwrap());
-    let forwarded: Vec<&str> = exports
+    let forwarded: Vec<&Export> = exports
         .iter()
-        .map(|(_, name)| name.as_str())
-        .filter(|name| !HOOKS.contains(name))
+        .filter(|export| !HOOKS.contains(&export.name.as_str()))
         .collect();
 
     fs::write(out_dir.join("forward.rs"), render_forwarders(&forwarded)).unwrap();
@@ -50,25 +51,43 @@ fn main() {
     }
 }
 
-fn parse_exports(text: &str) -> Vec<(u32, String)> {
+struct Export {
+    ordinal: u32,
+    name: String,
+    named: bool,
+}
+
+fn parse_exports(text: &str) -> Vec<Export> {
     text.lines()
-        .map(|line| {
-            let (ordinal, name) = line.split_once(' ').unwrap();
-            (ordinal.parse().unwrap(), name.to_string())
+        .map(|line| match line.split_once(' ') {
+            Some((ordinal, name)) => Export {
+                ordinal: ordinal.parse().unwrap(),
+                name: name.to_string(),
+                named: true,
+            },
+            None => Export {
+                ordinal: line.parse().unwrap(),
+                name: format!("Ordinal{line}"),
+                named: false,
+            },
         })
         .collect()
 }
 
-fn render_forwarders(forwarded: &[&str]) -> String {
+fn render_forwarders(forwarded: &[&Export]) -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "pub static FORWARD_NAMES: [&[u8]; {}] = [",
+        "pub static FORWARD_IMPORTS: [Import; {}] = [",
         forwarded.len()
     )
     .unwrap();
-    for name in forwarded {
-        writeln!(out, "    b\"{name}\\0\",").unwrap();
+    for export in forwarded {
+        if export.named {
+            writeln!(out, "    Import::Name(b\"{}\\0\"),", export.name).unwrap();
+        } else {
+            writeln!(out, "    Import::Ordinal({}),", export.ordinal).unwrap();
+        }
     }
     writeln!(out, "];\n").unwrap();
     writeln!(
@@ -80,7 +99,8 @@ fn render_forwarders(forwarded: &[&str]) -> String {
     .unwrap();
     writeln!(out, "#[cfg(windows)]").unwrap();
     writeln!(out, "core::arch::global_asm!(").unwrap();
-    for (index, name) in forwarded.iter().enumerate() {
+    for (index, export) in forwarded.iter().enumerate() {
+        let name = &export.name;
         writeln!(
             out,
             "    \".globl _{name}\\n_{name}:\\n    jmp dword ptr [{{targets}} + {}]\\n\",",
@@ -93,10 +113,11 @@ fn render_forwarders(forwarded: &[&str]) -> String {
     out
 }
 
-fn render_def(exports: &[(u32, String)]) -> String {
+fn render_def(exports: &[Export]) -> String {
     let mut out = String::from("LIBRARY WININET.DLL\nEXPORTS\n");
-    for (ordinal, name) in exports {
-        writeln!(out, "  {name} @{ordinal}").unwrap();
+    for export in exports {
+        let visibility = if export.named { "" } else { " NONAME" };
+        writeln!(out, "  {} @{}{visibility}", export.name, export.ordinal).unwrap();
     }
     out
 }

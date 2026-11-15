@@ -1,18 +1,24 @@
-use crate::html::HtmlRewriter;
+use crate::rewriter::Rewriter;
 
 use alloc::vec::Vec;
 
 pub struct Stream {
-    rewriter: Option<HtmlRewriter>,
+    rewriter: Option<Rewriter>,
     pending: Vec<u8>,
+    transcript: Option<Vec<u8>>,
     finished: bool,
 }
 
 impl Stream {
-    pub fn new(rewriter: Option<HtmlRewriter>) -> Self {
+    pub fn new(rewriter: Option<Rewriter>) -> Self {
+        let transcript = rewriter
+            .as_ref()
+            .is_some_and(Rewriter::replaces_cache_file)
+            .then(Vec::new);
         Stream {
             rewriter,
             pending: Vec::new(),
+            transcript,
             finished: false,
         }
     }
@@ -29,7 +35,19 @@ impl Stream {
         self.pending.len()
     }
 
+    pub fn cache_file_replacement(&self) -> Option<&[u8]> {
+        self.transcript.as_deref().filter(|_| self.finished)
+    }
+
     pub fn feed(&mut self, data: &[u8]) {
+        let start = self.pending.len();
+        self.rewrite(data);
+        if let Some(transcript) = &mut self.transcript {
+            transcript.extend_from_slice(&self.pending[start..]);
+        }
+    }
+
+    fn rewrite(&mut self, data: &[u8]) {
         let rewriter = self.rewriter.as_mut().unwrap();
 
         if data.is_empty() {

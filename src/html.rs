@@ -1,31 +1,25 @@
+use crate::css::CssRewriter;
 use crate::utf8::{self, Utf8Decoder};
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 const MAX_TAG_LENGTH: usize = 65536;
 
-const SUPPRESSED_ELEMENTS: &[&[u8]] = &[
-    b"script",
-    b"style",
-    b"template",
-    b"svg",
-    b"iframe",
-    b"object",
-    b"canvas",
-    b"video",
-    b"audio",
-];
+const SUPPRESSED_ELEMENTS: &[&[u8]] = &[b"script", b"template", b"svg", b"style"];
 
 const DROPPED_ELEMENTS: &[&[u8]] = &[
-    b"link",
     b"noscript",
     b"picture",
     b"source",
     b"track",
-    b"wbr",
+    b"video",
+    b"audio",
+    b"canvas",
 ];
 
-const BLOCK_ELEMENTS: &[&[u8]] = &[
+const RENAMED_ELEMENTS: &[&[u8]] = &[
     b"header",
     b"nav",
     b"main",
@@ -42,49 +36,9 @@ const BLOCK_ELEMENTS: &[&[u8]] = &[
     b"search",
 ];
 
-const ALLOWED_ATTRIBUTES: &[&[u8]] = &[
-    b"href",
-    b"src",
-    b"alt",
-    b"name",
-    b"title",
-    b"width",
-    b"height",
-    b"border",
-    b"align",
-    b"valign",
-    b"colspan",
-    b"rowspan",
-    b"nowrap",
-    b"cellpadding",
-    b"cellspacing",
-    b"bgcolor",
-    b"color",
-    b"face",
-    b"size",
-    b"clear",
-    b"hspace",
-    b"vspace",
-    b"usemap",
-    b"shape",
-    b"coords",
-    b"target",
-    b"action",
-    b"method",
-    b"type",
-    b"value",
-    b"maxlength",
-    b"checked",
-    b"selected",
-    b"multiple",
-    b"cols",
-    b"rows",
-    b"start",
-    b"content",
-    b"http-equiv",
-];
+const STYLE_ELEMENT: &[u8] = b"style";
+const RENAMED_ELEMENT_CLASS_PREFIX: &str = "ie-";
 
-#[derive(Default)]
 pub struct HtmlRewriter {
     state: State,
     text_decoder: Utf8Decoder,
@@ -92,6 +46,7 @@ pub struct HtmlRewriter {
     quote: u8,
     comment_dashes: u32,
     suppressed_element: Option<Vec<u8>>,
+    css: CssRewriter,
 }
 
 #[derive(Default, PartialEq)]
@@ -122,6 +77,18 @@ struct Attributes<'a> {
 }
 
 impl HtmlRewriter {
+    pub fn new(viewport_width: i32) -> Self {
+        HtmlRewriter {
+            state: State::default(),
+            text_decoder: Utf8Decoder::default(),
+            tag: Vec::new(),
+            quote: 0,
+            comment_dashes: 0,
+            suppressed_element: None,
+            css: CssRewriter::new(viewport_width),
+        }
+    }
+
     pub fn feed(&mut self, data: &[u8], output: &mut Vec<u8>) {
         for &byte in data {
             self.process_byte(byte, output);
@@ -151,7 +118,25 @@ impl HtmlRewriter {
             self.begin_tag(output);
         } else if self.suppressed_element.is_none() {
             self.text_decoder.feed(byte, output);
+        } else if self.is_in_style() {
+            self.feed_style(&[byte], output);
         }
+    }
+
+    fn is_in_style(&self) -> bool {
+        self.suppressed_element.as_deref() == Some(STYLE_ELEMENT)
+    }
+
+    fn feed_style(&mut self, data: &[u8], output: &mut Vec<u8>) {
+        let mut translated = Vec::new();
+        self.css.feed(data, &mut translated);
+        utf8::append_as_cp1252(output, &translated);
+    }
+
+    fn finish_style(&mut self, output: &mut Vec<u8>) {
+        let mut translated = Vec::new();
+        self.css.finish(&mut translated);
+        utf8::append_as_cp1252(output, &translated);
     }
 
     fn begin_tag(&mut self, output: &mut Vec<u8>) {
@@ -242,8 +227,16 @@ impl HtmlRewriter {
 
     fn rewrite_tag(&mut self, tag: &Tag, output: &mut Vec<u8>) {
         if let Some(suppressed) = &self.suppressed_element {
-            if tag.closing && tag.name.eq_ignore_ascii_case(suppressed) {
-                self.suppressed_element = None;
+            let ends_suppression = tag.closing && tag.name.eq_ignore_ascii_case(suppressed);
+            match (ends_suppression, self.is_in_style()) {
+                (true, true) => {
+                    self.finish_style(output);
+                    output.extend_from_slice(b"</style>");
+                    self.suppressed_element = None;
+                }
+                (true, false) => self.suppressed_element = None,
+                (false, true) => self.feed_style(tag.data, output),
+                (false, false) => {}
             }
             return;
         }
@@ -255,20 +248,20 @@ impl HtmlRewriter {
         if is_listed(tag.name, SUPPRESSED_ELEMENTS) {
             if !tag.closing && !tag.self_closing {
                 self.suppressed_element = Some(tag.name.to_ascii_lowercase());
+                if self.is_in_style() {
+                    output.extend_from_slice(b"<style>");
+                }
             }
             return;
         }
 
         if tag.name.eq_ignore_ascii_case(b"img") {
-            tag.append_image_replacement(output);
+            tag.append_image_replacement(&self.css, output);
             return;
         }
 
-        let name = if is_listed(tag.name, BLOCK_ELEMENTS) {
-            b"div"
-        } else {
-            tag.name
-        };
+        let renamed = is_renamed_element(tag.name);
+        let name = if renamed { b"div" } else { tag.name };
 
         output.push(b'<');
         if tag.closing {
@@ -276,13 +269,11 @@ impl HtmlRewriter {
         }
         output.extend_from_slice(name);
         if !tag.closing {
-            tag.append_attributes(output);
+            let element_class =
+                renamed.then(|| renamed_element_class(&String::from_utf8_lossy(tag.name)));
+            tag.append_attributes(element_class.as_deref(), &self.css, output);
         }
         output.push(b'>');
-
-        if tag.closing && name.eq_ignore_ascii_case(b"span") {
-            output.push(b' ');
-        }
     }
 }
 
@@ -313,7 +304,7 @@ impl<'a> Tag<'a> {
             .find(|attribute| attribute.name.eq_ignore_ascii_case(name))
     }
 
-    fn append_image_replacement(&self, output: &mut Vec<u8>) {
+    fn append_image_replacement(&self, css: &CssRewriter, output: &mut Vec<u8>) {
         if let Some(src) = self.find_attribute(b"src") {
             if is_svg_url(src.value) {
                 if let Some(alt) = self.find_attribute(b"alt") {
@@ -324,17 +315,37 @@ impl<'a> Tag<'a> {
         }
 
         output.extend_from_slice(b"<img");
-        self.append_attributes(output);
+        self.append_attributes(None, css, output);
         output.push(b'>');
     }
 
-    fn append_attributes(&self, output: &mut Vec<u8>) {
+    fn append_attributes(
+        &self,
+        element_class: Option<&str>,
+        css: &CssRewriter,
+        output: &mut Vec<u8>,
+    ) {
+        let mut pending_class = element_class;
+
         for attribute in self
             .attributes()
-            .filter(|attribute| is_listed(attribute.name, ALLOWED_ATTRIBUTES))
+            .filter(|attribute| !attribute.name.eq_ignore_ascii_case(b"charset"))
         {
-            output.push(b' ');
-            utf8::append_as_cp1252(output, attribute.raw);
+            if attribute.name.eq_ignore_ascii_case(b"style") {
+                append_style_attribute(attribute.value, css, output);
+            } else if let Some(class) =
+                pending_class.filter(|_| attribute.name.eq_ignore_ascii_case(b"class"))
+            {
+                append_class_attribute(class, attribute.value, output);
+                pending_class = None;
+            } else {
+                output.push(b' ');
+                utf8::append_as_cp1252(output, attribute.raw);
+            }
+        }
+
+        if let Some(class) = pending_class {
+            append_class_attribute(class, b"", output);
         }
     }
 }
@@ -393,6 +404,37 @@ impl<'a> Iterator for Attributes<'a> {
             value,
         })
     }
+}
+
+fn append_style_attribute(value: &[u8], css: &CssRewriter, output: &mut Vec<u8>) {
+    let declarations = css.translate_declarations(&String::from_utf8_lossy(value));
+    if declarations.is_empty() {
+        return;
+    }
+    output.extend_from_slice(b" style=\"");
+    utf8::append_as_cp1252(output, declarations.replace('"', "'").as_bytes());
+    output.push(b'"');
+}
+
+fn append_class_attribute(element_class: &str, classes: &[u8], output: &mut Vec<u8>) {
+    output.extend_from_slice(b" class=\"");
+    output.extend_from_slice(element_class.as_bytes());
+    if !classes.is_empty() {
+        output.push(b' ');
+        utf8::append_as_cp1252(output, classes);
+    }
+    output.push(b'"');
+}
+
+pub fn is_renamed_element(name: &[u8]) -> bool {
+    is_listed(name, RENAMED_ELEMENTS)
+}
+
+pub fn renamed_element_class(name: &str) -> String {
+    format!(
+        "{RENAMED_ELEMENT_CLASS_PREFIX}{}",
+        name.to_ascii_lowercase()
+    )
 }
 
 fn is_svg_url(url: &[u8]) -> bool {
